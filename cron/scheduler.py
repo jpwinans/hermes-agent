@@ -50,7 +50,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
 from agent.memory_provider import ctx_bound
-from agent.session_activity import AwakeIdleMeter
+from agent.session_activity import AwakeIdleMeter, quota_idle_seconds
 from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
@@ -1994,7 +1994,9 @@ def _run_agent_with_watchdog(
             return 0.0
         try:
             _act = agent.get_activity_summary()
-            return float(_act.get("seconds_since_activity", 0.0) or 0.0)
+            # A verified quota/repair wait is live ownership, not model progress.
+            # Both the watchdog and execution stamper consume this adjusted idle.
+            return quota_idle_seconds(agent, _act.get("seconds_since_activity", 0.0))
         except Exception:
             return 0.0
 

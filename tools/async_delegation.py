@@ -1218,8 +1218,10 @@ def _sweep_stale_locked(now: float):
         any_monitorable = True
         if not record.get("_started"):
             continue  # queued behind a full pool: not stalled, but keep the monitor alive for when it starts
+        quota_idle = float("inf")
         try:
             token, in_tool = progress_fn()
+            quota_idle = getattr(token, "quota_idle_seconds", float("inf"))
         except Exception:
             # An unreadable child must not look permanently healthy —
             # keep the last timestamp running instead of refreshing it.
@@ -1227,7 +1229,7 @@ def _sweep_stale_locked(now: float):
         if token != record.get("_progress_token"):
             record.update(_progress_token=token, _progress_ts=now)
             continue
-        quiet_for = now - (record.get("_progress_ts") or now)
+        quiet_for = min(now - (record.get("_progress_ts") or now), quota_idle)
         limit = _STALE_IN_TOOL_SECONDS if in_tool else _STALE_IDLE_SECONDS
         if quiet_for >= limit:
             # Stall context feeds the terminal event and status listings.

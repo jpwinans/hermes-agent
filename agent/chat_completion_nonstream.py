@@ -11,9 +11,10 @@ class _NonStreamRequest:
     instance; ``_abort_request`` may run from the poll (stranger) thread.
     """
 
-    def __init__(self, agent, api_kwargs: dict):
+    def __init__(self, agent, api_kwargs: dict, *, _credential_snapshot=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
+        self._credential_snapshot = _credential_snapshot
         self.result = {"response": None, "error": None}
         self.clients = h._RequestClientRegistry(agent)
         # Request-local cancel flag: agent._interrupt_requested is cleared at turn
@@ -59,14 +60,17 @@ class _NonStreamRequest:
         # Per-request clients are registered with the abort machinery so the watchdogs
         # force-close the worker's connection, never the shared client (#67142).
         if kind == "anthropic_messages":
-            client = self.agent._create_request_anthropic_client(reason=reason)
+            private = {} if self._credential_snapshot is None else {"_credential_snapshot": self._credential_snapshot}
+            client = self.agent._create_request_anthropic_client(reason=reason, **private)
         else:
-            client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
+            private = {} if self._credential_snapshot is None else {"_credential_snapshot": self._credential_snapshot}
+            client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs, **private)
         return self.clients.set_client(client, kind=kind)
 
     def _call(self):
         watchdog_state_var = watchdog_context_token = None
         try:
+            h._check_openai_snapshot_route(self.agent, self._credential_snapshot)
             self._install_codex_request_token()
             if self.codex_watchdog_state is not None:
                 from agent.codex_runtime import _codex_watchdog_state_var

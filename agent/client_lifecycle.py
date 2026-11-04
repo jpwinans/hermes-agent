@@ -7,7 +7,37 @@ import logging
 import threading
 import time
 from contextlib import suppress
+from dataclasses import dataclass
+from types import MappingProxyType
+from collections.abc import Mapping
 from typing import Any, Optional
+
+
+@dataclass(frozen=True, repr=False)
+class _OpenAIConstructorSnapshot:
+    """Private admitted constructor, not a client or model request parameter."""
+    provider: str
+    mode: str
+    kwargs: Mapping
+
+    def __post_init__(self):
+        detached = dict(self.kwargs)
+        for name in ("default_headers", "default_query"):
+            if isinstance(detached.get(name), Mapping):
+                detached[name] = MappingProxyType(dict(detached[name]))
+        object.__setattr__(self, "kwargs", MappingProxyType(detached))
+
+
+def _check_openai_snapshot_route(agent, snapshot):
+    # Native Anthropic's existing tuple contract is deliberately unchanged.
+    if isinstance(snapshot, _OpenAIConstructorSnapshot) and (
+        snapshot.provider != getattr(agent, "provider", None)
+        or snapshot.mode != getattr(agent, "api_mode", None)
+        or snapshot.mode not in ("chat_completions", "codex_responses")
+        or snapshot.provider == "moa"
+    ):
+        agent._interrupt_requested = True
+        raise InterruptedError("Admitted OpenAI transport changed before provider request")
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -438,13 +468,45 @@ class ClientLifecycleMixin:
         except Exception as exc:
             logger.debug("%s client abort failed (%s, shared=False) %s error=%s", label, reason, context, exc)
 
-    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+    def _check_admitted_openai_client(self, client, request_kwargs):
+        # The shared builder has provider hooks of its own. Reject a rebound
+        # result (including a stock cache hit) before opening a stream.
+        from openai import OpenAI
+        if (type(client) is not OpenAI
+            or client.api_key != request_kwargs.get("api_key")
+            or callable(getattr(client, "_api_key_provider", None))
+            or str(client.base_url).rstrip("/") != str(request_kwargs.get("base_url", "")).rstrip("/")
+            or getattr(client, "_custom_headers", {}) != (request_kwargs.get("default_headers") or {})
+            or getattr(client, "_custom_query", {}) != (request_kwargs.get("default_query") or {})):
+            self._interrupt_requested = True
+            self._close_request_openai_client(client, reason="snapshot_mismatch")
+            raise InterruptedError("Admitted OpenAI constructor changed before provider request")
+
+    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None,
+                                      _credential_snapshot=None) -> Any:
         from unittest.mock import Mock
-        primary_client = self._ensure_primary_openai_client(reason=reason)
-        if self.provider == "moa" or isinstance(primary_client, Mock):
-            return primary_client
-        with self._openai_client_lock():
-            request_kwargs = dict(self._client_kwargs)
+        if _credential_snapshot is None:
+            primary_client = self._ensure_primary_openai_client(reason=reason)
+            if self.provider == "moa" or isinstance(primary_client, Mock):
+                return primary_client
+            with self._openai_client_lock():
+                request_kwargs = dict(self._client_kwargs)
+        else:
+            if not isinstance(_credential_snapshot, _OpenAIConstructorSnapshot):
+                self._interrupt_requested = True
+                raise InterruptedError("Unsupported admitted OpenAI constructor snapshot")
+            _check_openai_snapshot_route(self, _credential_snapshot)
+            request_kwargs = dict(_credential_snapshot.kwargs)
+            for name in ("default_headers", "default_query"):
+                if isinstance(request_kwargs.get(name), Mapping):
+                    request_kwargs[name] = dict(request_kwargs[name])
+            # Match the unchanged builder's mandatory Codex identity policy,
+            # derived only from the already-admitted bearer and endpoint.
+            from agent.codex_headers import apply_required_codex_headers
+            apply_required_codex_headers(
+                request_kwargs, access_token=str(request_kwargs.get("api_key", "")),
+                base_url=str(request_kwargs.get("base_url", "")),
+            )
         # No SDK retry loop: the outer loop owns retries/rotation/fallback, and SDK retries stretch a hung
         # request ~3x past our stale detector.
         request_kwargs["max_retries"] = 0
@@ -455,13 +517,27 @@ class ClientLifecycleMixin:
                                          base_url=str(request_kwargs.get("base_url", "")),
                                          api_key=str(request_kwargs.get("api_key", "") or ""), has_images=True)
             if image_headers:
+                if _credential_snapshot is not None and (
+                    not isinstance(image_headers, Mapping)
+                    or any(str(key).lower() in ("authorization", "x-api-key", "host") for key in image_headers)
+                ):
+                    self._interrupt_requested = True
+                    raise InterruptedError("Unsafe image route headers after quota admission")
                 request_kwargs["default_headers"] = {**(request_kwargs.get("default_headers") or {}), **image_headers}
         cached, stale = self._checkout_request_slot(_OPENAI_SLOT, request_kwargs)
         if cached is not None:
+            if _credential_snapshot is not None:
+                self._check_admitted_openai_client(cached, request_kwargs)
             return cached
         if stale is not None:
             self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
-        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # Do not let a constructor hook mutate the values used for validation
+        # or the slot key; the admitted header/query values remain detached.
+        build_kwargs = ({k: dict(v) if isinstance(v, dict) else v for k, v in request_kwargs.items()}
+                        if _credential_snapshot is not None else request_kwargs)
+        client = self._create_openai_client(build_kwargs, reason=reason, shared=False)
+        if _credential_snapshot is not None:
+            self._check_admitted_openai_client(client, request_kwargs)
         # Snapshot nested dicts (default_headers) so an aliased inner object can't mutate the cache key.
         snapshot = {k: dict(v) if isinstance(v, dict) else v for k, v in request_kwargs.items()}
         self._store_request_slot(_OPENAI_SLOT, client, snapshot)
@@ -512,15 +588,20 @@ class ClientLifecycleMixin:
             return build_anthropic_bedrock_client(key[1], timeout=key[2])
         return build_anthropic_client(key[1], key[2], timeout=key[3], drop_context_1m_beta=key[4])
 
-    def _create_request_anthropic_client(self, *, reason: str) -> Any:
+    def _create_request_anthropic_client(self, *, reason: str, _credential_snapshot=None) -> Any:
         """Build (or reuse) a request-local Anthropic client for one in-flight call.
 
         The watchdog must never ``close()`` a client a worker is still reading (fd recycled under a live SSL BIO →
         TLS record in a SQLite header); per-request clients let the stranger ``shutdown()`` while the owner closes.
         """
-        if self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
-        key = self._request_anthropic_client_key()
+        if _credential_snapshot is None:
+            if self.api_mode == "anthropic_messages":
+                self._try_refresh_anthropic_client_credentials()
+            key = self._request_anthropic_client_key()
+        else:
+            # Owner admitted this exact immutable native key; never refresh it
+            # after admission, including on a bounded streaming retry.
+            key = _credential_snapshot
         cached, stale = self._checkout_request_slot(_ANTHROPIC_SLOT, key)
         if cached is not None:
             return cached

@@ -311,6 +311,10 @@ class ComputeHost:
             stamped_at = summary.get("last_activity_at")
             elapsed = summary.get("seconds_since_activity")
             if stamped_at is not None and stamped_at >= started_at and elapsed is not None and elapsed >= 0:
+                from agent.session_activity import quota_idle_seconds
+                # Serialize the effective idle clock once. The parent mirror only
+                # ages this sample; it must not subtract the child's wait credit.
+                elapsed = quota_idle_seconds(session["agent"], elapsed)
                 activity_ns = now_ns() - int(elapsed * 1_000_000_000)
         except Exception:
             logging.getLogger(__name__).debug("compute host activity unavailable sid=%s", sid, exc_info=True)

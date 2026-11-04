@@ -1,6 +1,7 @@
-"""A settled native input stays on disk while the transcript still tells a follow-up turn where it
-is saved (dokterdok N28), in whichever spelling the note used, and is bounded by main's 24 h media
-age once settled, as main's document cache cleanup bounded the staging copy the note used to name."""
+"""Transcript-owned native input survives settlement and age in either path spelling.
+
+Explicit retirement of its owned session, not age alone, permits collection.
+"""
 import os
 import time
 
@@ -42,11 +43,14 @@ def test_settled_native_document_named_by_the_transcript_survives_settlement(tmp
     try:
         release_admission_media(db, row['admission_id'])
         assert os.path.exists(retained), 'the follow-up turn is told to open a path settlement deleted'
-        # Settled and older than main's media age: collected whatever the transcript says.
+        # A quota wait can outlast the cache age; a follow-up still needs these bytes.
         old = time.time() - 25 * 3600
         os.utime(retained, (old, old))
         monkeypatch.setattr(media_module, '_last_sweep', {}, raising=False)
         release_admission_media(db, row['admission_id'])
+        assert os.path.exists(retained), 'age erased an attachment still owned by history'
+        # This fresh isolated test session is explicitly discarded, releasing its owners.
+        assert db.delete_session('s')
         assert not os.path.exists(retained) and list(_media_root().iterdir()) == []
     finally:
         db.close()

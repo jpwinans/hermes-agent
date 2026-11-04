@@ -325,6 +325,32 @@ def _child_last_event_age(child: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _quota_stale_seconds(child: Any, seconds: float) -> float:
+    """A wait is liveness, not progress; retain its credit after the marker exits."""
+    if not hasattr(child, "_quota_wait_clock"):
+        return seconds
+    from agent.session_activity import quota_idle_seconds
+    age = _child_last_event_age(child)
+    return min(seconds, quota_idle_seconds(child, age if age is not None else seconds))
+
+
+def _refresh_parent_quota_wait(parent: Any) -> bool:
+    """Only a synchronous join owns this parent marker; detached work never does."""
+    from agent.quota_pacing import Decision
+    from agent.session_activity import set_quota_wait
+    lock = getattr(parent, "_active_children_lock", None)
+    from contextlib import nullcontext
+    with lock if lock is not None else nullcontext():
+        children = getattr(parent, "_quota_wait_delegation_children", None)
+        if children is None:
+            return False
+        status = next((getattr(c, "_quota_wait_status", None) for c in children
+                       if getattr(c, "_quota_wait_clock", (None,))[0] is not None), None)
+        if status != getattr(parent, "_quota_wait_status", None):
+            set_quota_wait(parent, Decision(*status) if status is not None else None)
+        return status is not None
+
+
 class _Heartbeat:
     """One child's parent-activity heartbeat via the shared periodic scheduler
     (``agent.periodic_scheduler``) — not one daemon thread per child. NOT started at construction:
@@ -361,6 +387,9 @@ class _Heartbeat:
         touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
         if not touch:
             return None
+        parent_waiting = _refresh_parent_quota_wait(parent_agent)
+        if getattr(child, "_quota_wait_clock", (None,))[0] is not None:
+            return None  # policy/repair wait: neither stale nor semantic activity
         desc = f"delegate_task: subagent {task_index} working"
         try:
             child_summary = child.get_activity_summary()
@@ -380,7 +409,7 @@ class _Heartbeat:
             else:
                 last_seen["stale"] += 1
             stale_cycles = _HEARTBEAT_STALE_CYCLES_IN_TOOL if child_tool else _HEARTBEAT_STALE_CYCLES_IDLE
-            if last_seen["stale"] >= stale_cycles:
+            if _quota_stale_seconds(child, last_seen["stale"] * _HEARTBEAT_INTERVAL) >= stale_cycles * _HEARTBEAT_INTERVAL:
                 logger.warning(
                     "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — abandoning its wait",
                     task_index, last_seen["stale"], child_tool or "<none>",
@@ -395,8 +424,9 @@ class _Heartbeat:
                 desc = f"delegate_task: subagent {child_summary.get('last_activity_desc', '')} (iteration {child_iter}/{child_max})"
         except Exception:
             pass
-        with _quiet(None):
-            touch(desc)
+        if not parent_waiting:
+            with _quiet(None):
+                touch(desc)
         return None
 
 
@@ -871,33 +901,37 @@ class _ChildRun:
         every sign of progress, exactly the signals the heartbeat's stale verdict reads. Genuinely frozen children
         keep two authorities: this budget (when configured) and the heartbeat's stale threshold.
         """
-        if child_timeout is None:
-            settled.wait()
-            return
-        deadline = time.monotonic() + child_timeout
-        warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
+        # Poll even without a configured cap so the synchronous parent's wait
+        # marker follows entry/exit without an invented activity heartbeat.
+        deadline = time.monotonic() + child_timeout if child_timeout is not None else None
         warned = False
         fingerprint = _child_activity_fingerprint(self.child)
-        while True:
-            now = time.monotonic()
-            remaining = deadline - now
+        while not settled.is_set():
+            _refresh_parent_quota_wait(self.parent_agent)
+            if deadline is None:
+                settled.wait(timeout=_LIVENESS_POLL_SECONDS)
+                continue
+            assert child_timeout is not None
+            idle = _quota_stale_seconds(self.child, max(0.0, time.monotonic() - deadline + child_timeout))
+            remaining = child_timeout - idle
             if remaining <= 0:
-                return  # no progress for the whole budget
+                return
             wait = min(_LIVENESS_POLL_SECONDS, remaining)
             if not warned:
-                wait = min(wait, max(warn_at - now, 0.0))
+                wait = min(wait, max(child_timeout * _BUDGET_WARNING_FRACTION - idle, 0.0))
             settled.wait(timeout=wait)
             if settled.is_set():
-                return  # the worker finished, or the heartbeat declared the child stale
+                return
             current = _child_activity_fingerprint(self.child)
             if current != fingerprint:
                 fingerprint = current
                 deadline = time.monotonic() + child_timeout
-                warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
-                warned = False  # a fresh window gets its own warning
-            elif not warned and time.monotonic() >= warn_at:
-                warned = True
-                _warn_child_budget(self.child, child_timeout - (deadline - time.monotonic()), child_timeout)
+                warned = False
+            elif not warned:
+                idle = _quota_stale_seconds(self.child, max(0.0, time.monotonic() - deadline + child_timeout))
+                if idle >= child_timeout * _BUDGET_WARNING_FRACTION:
+                    warned = True
+                    _warn_child_budget(self.child, idle, child_timeout)
 
     def await_child(self) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], bool]:
         """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,

@@ -147,3 +147,63 @@ class AwakeIdleMeter:
         # credit until the next poll; only older credit can be trimmed by renewed activity.
         self._asleep_s = max(0.0, min(self._asleep_s, idle_s + slept_s))
         return max(0.0, idle_s - self._asleep_s)
+
+
+def set_quota_wait(agent: Any, decision) -> None:
+    """Local live wait, not a progress heartbeat; invalidate pre-wait abort claims.
+
+    The immutable clock tuple keeps lock-free gateway observations consistent.
+    Credit belongs only to the last real activity stamp; a new stamp discards it.
+    """
+    from agent.activity_tracking import _activity_lock
+    notice = None
+    with _activity_lock(agent):
+        now = time.time()
+        activity = getattr(agent, "_last_activity_ts", None)
+        started, credit, stamp = getattr(agent, "_quota_wait_clock", (None, 0.0, activity))
+        if stamp != activity:
+            credit = 0.0
+        if decision is not None:
+            if started is None:
+                started = now
+            status = (decision.action, decision.reason)
+            message = quota_wait_message(decision)
+            if (status != getattr(agent, "_quota_wait_status", None) and decision.action == "hold"
+                    and decision.reason != "checking_quota"):
+                notice = message  # a real pause only; a routine check or a meter fault says nothing
+            agent._quota_wait_status = status
+            agent._quota_wait_message = message
+        else:
+            if started is not None:
+                credit += max(0.0, now - max(started, activity or started))
+            started = None
+            agent._quota_wait_status = None
+            agent._quota_wait_message = None
+        agent._quota_wait_clock = (started, credit, activity)
+        agent._turn_liveness_activity_generation = getattr(agent, "_turn_liveness_activity_generation", 0) + 1
+        agent._turn_liveness_abort_claim = None
+    if notice is not None:
+        import logging
+        logging.getLogger(__name__).warning("%s", notice)
+        # Drivers may re-enter the activity accessor. Publish first, then present
+        # outside the lock; a failed presentation must never become a send retry.
+        with suppress(Exception):
+            agent._emit_warning(notice)
+
+
+def quota_idle_seconds(agent: Any, idle_seconds: float) -> float:
+    """Exclude only live quota waits, retaining raw activity timestamps/labels."""
+    started, credit, stamp = getattr(agent, "_quota_wait_clock", (None, 0.0, None))
+    if started is not None:
+        return 0.0
+    if stamp != getattr(agent, "_last_activity_ts", None):
+        credit = 0.0
+    return max(0.0, float(idle_seconds or 0.0) - credit)
+
+
+def quota_wait_message(decision) -> str:
+    """The one line shown for a real pace pause; work continues by itself when it lifts."""
+    note = getattr(decision, "note", "")
+    if decision.action == "hold" and note:
+        return note
+    return "Pacing pause: waiting for provider quota, then continuing automatically."

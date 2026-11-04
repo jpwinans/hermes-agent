@@ -231,7 +231,7 @@ def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload,
     unowned = [reference for reference in fresh if reference['path'] not in kept]
     if unowned:
         drop_capture_lease({reference['path'] for reference in unowned})
-        release_unheld_media(db, unowned, retain_history=False)
+        release_unheld_media(db, unowned)
     return resolved
 
 def _attachment_hashes(paths):
@@ -384,6 +384,66 @@ def admission_media_references(payload):
         payload.get('native_text_v1', {}).get('media', ()))
 
 
+def _failed_input_history(conn, row, references):
+    """Verified native caption/reference handoff, not evidence of execution.
+
+    The admission itself is the fail-closed owner until this proof succeeds. No
+    pending marker can fail to write before settlement, and no result is rewritten.
+    A later history removal conservatively restores this hold; explicit session
+    retirement removes the admission references as well as its history.
+    """
+    from agent.redact import redact_sensitive_text
+    from hermes_state_local_lineage import local_physical_target
+    from hermes_state_runtime import _canonical_chain
+    sessions = _canonical_chain(conn, local_physical_target(conn, row['target_session_id']))
+    text = redact_sensitive_text(row['payload'].get('text') or '')
+    contents = [str(content) for (content,) in conn.execute(
+        'SELECT content FROM messages WHERE (active=1 OR compacted=1) AND session_id IN (SELECT value FROM json_each(?))',
+        (json.dumps(sessions),))]
+    caption_saved = not text or any(text in content or json.dumps(text)[1:-1] in content for content in contents)
+    mentioned = _history_mentions(conn, references, session_ids=sessions)
+    return sessions[-1], caption_saved and all(ref['path'] in mentioned for ref in references)
+
+
+def _handoff_failed_media(db, row, *, reject_active_turn_lease=False):
+    """Keep failed/interrupted input available to a manual same-session follow-up.
+
+    Native history receives context, never an executable user turn or automatic
+    retry. An append/storage/lease failure leaves the terminal ledger holder intact.
+    Exact read-back makes retries idempotent even if a commit reported failure.
+    """
+    if row['outcome'] not in ('failed', 'interrupted'):
+        return
+    references = admission_media_references(row['payload'])
+    if not references:
+        return
+    from hermes_state_runtime import _admission, _row
+    def write(conn):
+        current = _row(_admission(conn, row['admission_id']))
+        if (current is None or current['status'] != 'terminal' or current['owner_epoch'] != row['owner_epoch']
+                or current['generation'] != row['generation'] or current['payload'] != row['payload']
+                or current['outcome'] != row['outcome']):
+            raise RuntimeStoreError('stale_generation')
+        target, saved = _failed_input_history(conn, current, references)
+        if saved:
+            return
+        from agent.redact import redact_sensitive_text
+        import time
+        content = (f"[Retained input from {current['outcome']} turn {current['admission_id']}. "
+                   "This is recovery context, not a request to replay the turn. Retention does not "
+                   "establish that its instructions or effects executed or completed. Review prior "
+                   "results before explicitly continuing.]\nOriginal user input:\n"
+                   + (current['payload'].get('text') or '') + '\n'
+                   + '\n'.join('Retained attachment: ' + ref['path'] for ref in references))
+        if reject_active_turn_lease:
+            db._check_transcript_write_guards(conn, target, None, reject_active_turn_lease=True)
+        db._append_messages_in_transaction(conn, target, [
+            {'role': 'assistant', 'content': redact_sensitive_text(content), 'timestamp': time.time()}])
+        if not _failed_input_history(conn, current, references)[1]:
+            raise RuntimeStoreError('storage_unavailable')
+    db._execute_write(write)
+
+
 def _held_media_paths(conn):
     # Project only references, not potentially large inline-image/history payloads; a live hosted
     # row's prompt is projected too, because its documents are held by text, not by a reference.
@@ -403,6 +463,21 @@ def _held_media_paths(conn):
             references.extend(native or ())
             references.extend(hosted_document_references(request_id, {'text': text}))
         held.update(reference['path'] for reference in references)
+    # A terminal failure is not an explicit discard. Its immutable admitted input
+    # holds bytes until the current native transcript has the caption AND all refs.
+    # This fallback is already durable when terminal status commits: no separate
+    # marker write can fail open, and even a direct collector cannot skip it.
+    rows = conn.execute("""SELECT target_session_id, json_extract(payload_json, '$.text'),
+        json_extract(payload_json, '$.attachments_v1.media', '$.native_text_v1.media')
+        FROM session_admissions WHERE status='terminal' AND outcome IN ('failed','interrupted')
+        AND (json_type(payload_json, '$.attachments_v1.media') IS NOT NULL
+             OR json_type(payload_json, '$.native_text_v1.media') IS NOT NULL)""").fetchall()
+    for target, text, encoded in rows:
+        attachments, native = json.loads(encoded)
+        references = list(attachments or ()) + list(native or ())
+        row = {'target_session_id': target, 'payload': {'text': text}}
+        if references and not _failed_input_history(conn, row, references)[1]:
+            held.update(ref['path'] for ref in references)
     return held
 
 
@@ -429,8 +504,9 @@ def _held_file_identities(paths, root):
 def release_admission_media(db, admission_id):
     """Delete eligible terminal native bytes unless another retained input holds them.
 
-    Terminal rows are exact-retry evidence by digest only; their bytes are not
-    replayed. Rows that are not terminal (queued, started, unknown) may still
+    Terminal admissions are never replayed. Failed/interrupted inputs also hold
+    bytes until native history has their caption and references; queued discard
+    is separate. Rows that are not terminal (queued, started, unknown) may still
     execute, so any path they reference stays on disk; API image references stay
     on disk in every status because they remain history context after settlement,
     and are holders only (see ``collect_unheld_api_images``). Different regular
@@ -446,10 +522,12 @@ def release_admission_media(db, admission_id):
         # Settled: inline base64 of committed images and the client history are redundant row weight.
         from gateway.session_api_media import compact_settled_api_payloads
         compact_settled_api_payloads(db, admission_id)
-    # Native and hosted inputs are named in the prompt the transcript keeps ("It is saved at: <path>"),
-    # so they are history context like an API image: they go once no live row and no transcript row
-    # names them, never while a follow-up turn can still be told to read them. Session deletion
-    # collects them through ``retire_media``; ``sweep_settled_media`` bounds the rest at main's 24 h.
+    # A failed turn can have settled before the first history write. Publish its
+    # original caption/refs as non-executable recovery context before dropping the
+    # ledger hold; failure leaves that hold in place for a later cleanup attempt.
+    _handoff_failed_media(db, row)
+    # Named native inputs remain context until their existing owners retire them;
+    # age alone cannot erase an attachment a manual follow-up still needs.
     released = release_unheld_media(db, admission_media_references(row['payload']))
     released += release_unheld_media(db, hosted_document_references(row['request_id'], row['payload']))
     return released + sweep_settled_media(db)
@@ -460,10 +538,10 @@ _last_sweep = {}
 
 
 def sweep_settled_media(db, *, now=None):
-    """At most hourly per store: collect settled native/attachment inputs older than
-    ``MEDIA_CACHE_MAX_AGE_HOURS`` whatever the transcript says, as main's age-based document cache
-    cleanup did for the staging copy the note used to name. A live admission or an in-flight capture
-    still holds its bytes; API images and hosted documents keep their own owners."""
+    """At most hourly per store: collect old settled inputs only after their
+    admission, capture AND transcript owners release them. Age is an eligibility
+    threshold, not permission to erase a referenced attachment. API images and
+    hosted documents keep their own owners."""
     import time
     from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
     now = time.time() if now is None else now
@@ -471,12 +549,20 @@ def sweep_settled_media(db, *, now=None):
         return 0
     _last_sweep[db.db_path] = now
     with db._read_ctx() as conn:
-        rows = conn.execute("""SELECT json_extract(payload_json, '$.attachments_v1.media', '$.native_text_v1.media')
+        rows = conn.execute("""SELECT admission_id, json_extract(payload_json, '$.attachments_v1.media', '$.native_text_v1.media')
             FROM session_admissions WHERE status='terminal' AND (json_type(payload_json, '$.attachments_v1.media')
             IS NOT NULL OR json_type(payload_json, '$.native_text_v1.media') IS NOT NULL)""").fetchall()
     cutoff = now - MEDIA_CACHE_MAX_AGE_HOURS * 3600
     stale = {}
-    for (encoded,) in rows:
+    from hermes_state_runtime import get_session_admission
+    for admission_id, encoded in rows:
+        # Retry a previously failed history handoff, never the failed execution.
+        try:
+            row = get_session_admission(db, admission_id=admission_id)
+            if row is not None:
+                _handoff_failed_media(db, row, reject_active_turn_lease=True)
+        except Exception:
+            logger.exception('Input history handoff failed; admission retains its media: %s', admission_id)
         attachments, native = json.loads(encoded)
         for reference in (attachments or []) + (native or []):
             try:
@@ -484,7 +570,7 @@ def sweep_settled_media(db, *, now=None):
                     stale[reference['path']] = reference
             except OSError:
                 continue
-    return release_unheld_media(db, list(stale.values()), retain_history=False) if stale else 0
+    return release_unheld_media(db, list(stale.values())) if stale else 0
 
 
 def collect_unheld_api_images(db):
@@ -513,7 +599,7 @@ def collect_unheld_api_images(db):
         return 0
 
 
-def _history_mentions(conn, references, after_id=0):
+def _history_mentions(conn, references, after_id=0, *, session_ids=None):
     """Candidate paths any transcript row (id > after_id) mentions raw or JSON-escaped, in ONE
     messages pass. Rows are prefiltered in SQL on the literal text before each candidate's digest
     directory, so only rows that could name a candidate reach Python's exact substring test."""
@@ -530,8 +616,12 @@ def _history_mentions(conn, references, after_id=0):
     # must not grow with the candidate count (SQLite's expression-depth limit fails at ~1000 terms).
     query = ('WITH digests(value) AS MATERIALIZED (SELECT value FROM json_each(?)) SELECT content FROM messages '
              'WHERE EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))' + (' AND id>?' if after_id else ''))
+    params = (json.dumps(prefixes), *((after_id,) if after_id else ()))
+    if session_ids is not None:
+        query += ' AND (active=1 OR compacted=1) AND session_id IN (SELECT value FROM json_each(?))'
+        params += (json.dumps(session_ids),)
     mentioned = set()
-    for (content,) in conn.execute(query, (json.dumps(prefixes), *((after_id,) if after_id else ()))):
+    for (content,) in conn.execute(query, params):
         text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
         mentioned.update(raw for needle, raw in needles.items() if needle in text)
     return mentioned

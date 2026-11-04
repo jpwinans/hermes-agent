@@ -945,8 +945,9 @@ def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
     if not callable(summary_fn := getattr(session.get("agent"), "get_activity_summary", None)):
         return False
     try:
+        from agent.session_activity import quota_idle_seconds
         elapsed = summary_fn().get("seconds_since_activity")
-        return elapsed is not None and float(elapsed) < _WS_ORPHAN_ACTIVITY_STALE_S
+        return elapsed is not None and quota_idle_seconds(session.get("agent"), float(elapsed)) < _WS_ORPHAN_ACTIVITY_STALE_S
     except Exception:
         return False
 

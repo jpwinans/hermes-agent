@@ -66,6 +66,11 @@ class ActivityTrackingMixin:
                 getattr(self, "_turn_liveness_activity_generation", 0) + 1
             )
             self._last_activity_ts = time.time()
+            # Real progress resets wait credit, even if two stamps share a clock tick.
+            quota_clock = getattr(self, "_quota_wait_clock", None)
+            if quota_clock is not None:
+                started = self._last_activity_ts if quota_clock[0] is not None else None
+                self._quota_wait_clock = (started, 0.0, self._last_activity_ts)
             self._last_activity_desc = bound_activity_description(desc)
             self._last_activity_provenance = resolved_provenance
             # Real progress invalidates a reserved abort claim; an in-flight watchdog interrupt must abandon

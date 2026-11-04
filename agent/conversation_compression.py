@@ -32,7 +32,7 @@ from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
-from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_deadline import resolve_context_compression_timeouts, account_quota_wait, quota_budget_clock, quota_deadline, quota_deadline_exceeded
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
     _emit_compression_attempt_telemetry, _record_committed_attempt_effect, _snapshot_compression_effect_input,
@@ -486,8 +486,11 @@ class CompressionCommitFence:
         self._lock_release_guard = threading.Lock()
         self._cancelled_lock_release: Optional[Callable[[], None]] = None
         self._cancelled_lock_release_requested = False
-        # Touched per streamed token so waiters tell SLOW-but-alive from HUNG (no fixed wall-clock kill).
         self._last_progress = time.monotonic()
+        self._quota_clock_lock = threading.RLock()
+        self._quota_wait_started: float | None = None
+        self._quota_paused = 0.0
+        self._idle_timeout_seconds: float | None = None
         self._progress_observed = False
         self._deadline: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
@@ -511,9 +514,7 @@ class CompressionCommitFence:
         self._deadline = deadline
 
     def extend_deadline(self, seconds: float) -> bool:
-        """Push the armed deadline back by *seconds* (time llama-server spent reading the prompt). A cancelled
-        attempt or a passed deadline stays final, so a late progress chunk can't revive it; while a commit or a
-        cancellation holds the lock there is nothing to extend."""
+        """Credit prompt-reading time; never revive a dead fence or extend through commit/cancel."""
         if seconds <= 0 or not self._lock.acquire(blocking=False):
             return False
         try:
@@ -525,9 +526,13 @@ class CompressionCommitFence:
             self._lock.release()
 
     def touch_progress(self) -> None:
-        """Record forward progress (a streamed token); a bare float store is atomic, so no lock."""
-        self._last_progress = time.monotonic()
+        """Record semantic provider progress on the budget clock."""
+        with self._quota_clock_lock:
+            self._last_progress = quota_budget_clock(self, time.monotonic())
         self._progress_observed = True
+
+    def quota_wait(self, decision: Any) -> bool:
+        return account_quota_wait(self, decision, time.monotonic)
 
     @property
     def progress_observed(self) -> bool:
@@ -536,24 +541,16 @@ class CompressionCommitFence:
 
     @property
     def deadline_exceeded(self) -> bool:
-        deadline = self._deadline
-        return deadline is not None and time.monotonic() >= deadline
+        return quota_deadline_exceeded(self, time.monotonic)
 
     @property
     def deadline_monotonic(self) -> float | None:
-        """Armed deadline (absolute monotonic); the worker's stream consumer stops when the host stops waiting.
-
-        :meth:`set_total_ceiling_seconds` documents this deadline as "shared by the host and worker", but
-        until #99692 only the host could read it — ``deadline_exceeded`` answers "is it past?" for a caller
-        that is already polling, which is useless to a worker blocked inside a provider stream. Publishing
-        the instant itself lets the worker's stream consumer stop at exactly the moment the host stops
-        waiting (see ``auxiliary_client.aux_stream_deadline``).
-        """
-        return self._deadline
+        """Live host/stream precommit deadline, excluding an active verified wait (#99692)."""
+        return quota_deadline(self, time.monotonic)
 
     def seconds_since_progress(self) -> float:
-        """Seconds since the worker last reported forward progress."""
-        return max(0.0, time.monotonic() - self._last_progress)
+        with self._quota_clock_lock:
+            return max(0.0, quota_budget_clock(self, time.monotonic()) - self._last_progress)
 
     def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit (``True``), or block until an active commit finishes (``False``)."""
@@ -1068,7 +1065,9 @@ def _await_worker_within_budget(
         # The fence deadline moves: prompt reading on llama-server pushes it back.
         remaining_ceiling = (fence.deadline_monotonic or wait_started + ceiling) - time.monotonic()
         if remaining_ceiling <= 0:
-            return False, None
+            if fence.deadline_exceeded:
+                return False, None
+            continue
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
         wait_slice = min(max(idle - since_progress, 0.005), remaining_ceiling)
@@ -1220,6 +1219,7 @@ def run_compress_context_with_progress_timeout(
             return messages, _resolve_fallback_prompt()
         idle = min(idle, ceiling)
     fence = fence if fence is not None else CompressionCommitFence()
+    fence._idle_timeout_seconds = idle
     fence.set_precommit_deadline_monotonic(precommit_deadline_monotonic)
     # Read BEFORE this attempt runs: the host's ``stalled`` record and the cancelled worker's
     # ``stall_interrupted`` record both land during the unwind below, and this stall must not count as

@@ -1477,11 +1477,20 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             if worker.agent_timeout is not None:
                 if worker.timeout_fired.is_set():
                     break
-                _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
+                from agent.session_activity import quota_idle_seconds
+                _idle_secs = turn_ctx.awake_idle.measure(quota_idle_seconds(
+                    agent_holder[0], self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)))
                 if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
+                    if hasattr(agent_holder[0], "_quota_wait_clock"):
+                        committed = await asyncio.to_thread(
+                            _abandon_timed_out_gateway_turn, agent_holder=agent_holder,
+                            inactivity_timeout=worker.agent_timeout, **self._reaper_kwargs(worker))
+                        if committed:
+                            break
+                        continue
                     threading.Thread(
                         target=_abandon_timed_out_gateway_turn,
                         kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},

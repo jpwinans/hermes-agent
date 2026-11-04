@@ -20,7 +20,7 @@ import pytest
 
 from gateway import session_ingress_media as media
 from gateway.session_results import admission_result, execution_result, finish_result
-from gateway.session_settlement_recovery import commit_and_publish
+from gateway.session_settlement_recovery import _release_media, commit_and_publish
 from gateway.session_transcript import SessionTranscriptMixin, TranscriptReadError
 from hermes_state import SessionDB
 from hermes_state_runtime import (
@@ -126,6 +126,8 @@ def publish_captured(state, row, captured):
                        '', 'completed', captured, result)
     assert events and events[-1]['admission_id'] == row['admission_id']
     assert events[-1]['status'] in ('interrupted', 'error')
+    # Production releases turn media after delivery, on the authority's collector.
+    _release_media(authority, row['admission_id'])
     return result['settled']
 
 

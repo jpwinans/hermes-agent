@@ -597,9 +597,9 @@ class SessionAuthority:
             return admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,
                                        request_id=request_id, payload=payload, _authorize_write=authorize)
         except Exception:
-            # A refused admission owns nothing it captured (unless another admission holds the same bytes).
+            # Refusal creates no new owner; prior transcript/admission/capture owners still count.
             drop_capture_lease()
-            release_unheld_media(self.db, fresh, retain_history=False)
+            release_unheld_media(self.db, fresh)
             raise
 
     def _current_owner(self, session_id):

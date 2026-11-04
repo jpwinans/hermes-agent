@@ -33,6 +33,8 @@
 
 set -euo pipefail
 
+_contained() { [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = 1 ] && [ -n "${HERMES_TEST_ISOLATION:-}" ] && [ -z "${PYTEST_CURRENT_TEST:-}" ]; }
+
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -71,6 +73,7 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
 # or an account without a usable store keep today's per-home layout.
 # Prints the account home, then the pinned Python minor.
 _account_tool_store() {
+  [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" != 1 ] || return 1
   local account py_minor
   [ -z "${HERMES_RUNTIME_DIR:-}" ] || return 1
   case "${HERMES_HOME:-}" in "" | "$HOME/.hermes" | "$HOME/.hermes/"*) ;; *) return 1 ;; esac
@@ -101,7 +104,14 @@ if _shared="$(_account_tool_store)"; then
   echo "▶ faked HOME: using the account's tool store $HERMES_RUNTIME_DIR"
 fi
 unset _account _shared
-if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
+if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = 1 ]; then
+  # No activation/provisioning fallback, even with an inherited activation stamp.
+  _has_pytest "${HERMES_PYTHON:-}" || {
+    echo "error: lazy installs disabled; provide an existing HERMES_PYTHON with pytest" >&2
+    exit 1
+  }
+  PYTHON="$HERMES_PYTHON"
+elif [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
 else
@@ -219,6 +229,16 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
 done
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
+if _contained; then
+  # Only owned location redirects and guards cross this boundary; never CI opt-ins.
+  WIN_ENV=(); TEST_ENV=(); EXTRA_PYTHONPATH=""; EXTRA_PYTEST_PLUGINS=""
+  unset HERMES_RUN_SLOW_PET_TESTS HERMES_E2E_BROWSER HERMES_RUN_E2E
+  for _var in HERMES_DISABLE_LAZY_INSTALLS HERMES_TEST_ISOLATION HERMES_HOME TMPDIR \
+      PYTHONDONTWRITEBYTECODE PYTHONPYCACHEPREFIX XDG_CACHE_HOME XDG_CONFIG_HOME \
+      XDG_DATA_HOME XDG_STATE_HOME USERPROFILE HERMES_GATEWAY_LOCK_DIR; do
+    [ -z "${!_var:-}" ] || TEST_ENV+=("$_var=${!_var}")
+  done
+fi
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
 # Never forward HERMES_RUNTIME_DIR or UV_PYTHON_INSTALL_DIR: under a faked HOME
@@ -234,7 +254,9 @@ cd "$REPO_ROOT"
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
 echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" != 1 ]; then
+  "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+fi
 
 echo "▶ launching test runner"
 exec env -i \

@@ -543,6 +543,9 @@ def pytest_configure(config):
     """
     fp = _fingerprint_gateway_tests()
     cache_dir = Path.cwd() / ".pytest-cache"
+    if (os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1"
+            and os.environ.get("HERMES_TEST_ISOLATION") and os.environ.get("TMPDIR")):
+        cache_dir = Path(os.environ["TMPDIR"]) / "gateway-adapter-guard"
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 

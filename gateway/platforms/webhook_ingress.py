@@ -209,10 +209,10 @@ async def _delivery_turn(key):
 async def _release_preparation(authority, payload):
     """A delivery a plugin skipped or consumed, or one refused or cancelled after preparing, is never
     admitted: release the media its preparation (``_prepared``) copied into the retained store. A path
-    another admission or an in-flight capture holds is kept, as for a refused admission."""
+    prior history, another admission or an in-flight capture holds is kept, as for a refused admission."""
     from gateway.session_ingress_media import release_unheld_media
     if media := payload['native_text_v1'].get('media'):
-        await asyncio.to_thread(release_unheld_media, authority.db, media, retain_history=False)
+        await asyncio.to_thread(release_unheld_media, authority.db, media)
 
 
 async def _prepared(authority, event):

@@ -1068,10 +1068,13 @@ def build_resume_recovery_note(
             "No user is present on this non-interactive platform, "
             "so do NOT emit a 'session restored' acknowledgement "
             "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion.")
+            "CONTINUE only safe or reconciled work toward completion. If an effect cannot be "
+            "reconciled safely, report the uncertainty and leave that work for manual reconciliation.")
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
+            "Do NOT re-run tool calls whose results already appear in the history. "
+            "Before repeating any unanswered potentially effectful call, reconcile whether its effect "
+            "already ran; absence of a recorded result is not proof that the effect did not run. "
+            "Do not repeat uncertain effects blindly.")
     return (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
@@ -2691,20 +2694,43 @@ def _dump_wedged_turn_stacks(task_id: str) -> None:
 def _abandon_timed_out_gateway_turn(
     *, agent_holder, task_id: str, process_baseline, worker_done: threading.Event,
     timeout_fired: threading.Event, cleanup_lock: threading.Lock,
-    is_still_current: Optional[Callable[[], bool]] = None) -> bool:
+    is_still_current: Optional[Callable[[], bool]] = None,
+    inactivity_timeout: Optional[float] = None) -> bool:
     """Interrupt one timed-out turn and reap only processes it created."""
+    quota_interrupted = False
+    agent = agent_holder[0] if agent_holder else None
     with cleanup_lock:
         if worker_done.is_set() or timeout_fired.is_set():
             return False
+        if agent is not None and hasattr(agent, "_quota_wait_clock") and inactivity_timeout is not None:
+            from agent.session_activity import quota_idle_seconds
+            from agent.activity_tracking import _activity_lock
+            with _activity_lock(agent):
+                activity = getattr(agent, "_last_activity_ts", None)
+                if getattr(agent, "_quota_wait_clock", (None,))[0] is not None:
+                    return False
+                if activity is not None and quota_idle_seconds(agent, time.time() - activity) < inactivity_timeout:
+                    return False
+                generation = getattr(agent, "_turn_liveness_activity_generation", 0)
+            # Capture evidence before interruption unwinds the held frame.
+            _dump_wedged_turn_stacks(task_id)
+            # Native generation claim invalidates a timeout that crossed wait entry/exit.
+            quota_interrupted = agent.interrupt(
+                _INTERRUPT_REASON_TIMEOUT, hard_cancel=True,
+                tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT, require_generation=generation)
+            if not quota_interrupted:
+                return False
         timeout_fired.set()
 
     # BEFORE interrupting: the interrupt frees the blocked frame, destroying the only evidence.
-    _dump_wedged_turn_stacks(task_id)
+    if not quota_interrupted:
+        _dump_wedged_turn_stacks(task_id)
 
     agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
-            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
+            if not quota_interrupted:
+                request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
         from hermes_cli.observability.shared_metrics_process import record_watchdog_turn_abort
@@ -2736,9 +2762,17 @@ def _watch_gateway_turn_inactivity(
         now = time.monotonic()
         idle_seconds = now - activity_origin
         agent = agent_holder[0] if agent_holder else None
+        if agent is not None and getattr(agent, "_quota_wait_clock", (None,))[0] is not None:
+            # A live local wait remains exempt even if diagnostic snapshot reading fails.
+            awake_idle.measure(0.0)
+            activity_origin = now
+            continue
         if agent is not None and hasattr(agent, "get_activity_summary"):
             try:
+                from agent.session_activity import quota_idle_seconds
                 reported_idle = agent.get_activity_summary().get("seconds_since_activity")
+                if reported_idle is not None:
+                    reported_idle = quota_idle_seconds(agent, reported_idle)
                 if reported_idle is not None:
                     idle_seconds = awake_idle.measure(max(0.0, float(reported_idle)))
                     # Preserve the most recent usable activity clock as the fallback if
@@ -2748,11 +2782,11 @@ def _watch_gateway_turn_inactivity(
                 pass
         if idle_seconds < timeout:
             continue
-        _abandon_timed_out_gateway_turn(
+        if _abandon_timed_out_gateway_turn(
             agent_holder=agent_holder, task_id=task_id, process_baseline=process_baseline,
             worker_done=worker_done, timeout_fired=timeout_fired, cleanup_lock=cleanup_lock,
-            is_still_current=is_still_current)
-        return
+            is_still_current=is_still_current, inactivity_timeout=timeout):
+            return
 
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset({

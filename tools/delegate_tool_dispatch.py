@@ -155,6 +155,9 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
         futures = {executor.submit(contextvars.copy_context().run, batch.run_child, i, t, child): i for i, t, child in batch.children}
         pending = set(futures)
         while pending:
+            if honor_parent_interrupt:
+                from tools.delegate_tool_child_run import _refresh_parent_quota_wait
+                _refresh_parent_quota_wait(parent_agent)
             if honor_parent_interrupt and getattr(parent_agent, "_interrupt_requested", False) is True:
                 results.extend(_entry_of(f, futures[f]) for f in pending)
                 interrupted = True
@@ -189,13 +192,35 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     record (retention pruning happens on future dispatches)."""
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
-    if len(batch.children) == 1:
-        results.append(batch.run_child(*batch.children[0]))
-        # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
-        # transcript, manifest, then the durable write — is still owner-lifetime: record before any of it (#116000).
-        _record_finished_child(batch, results[-1], honor_parent_interrupt)
-    else:
-        _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
+    parent = batch.parent_agent
+    joined = [c for _, _, c in batch.children] if honor_parent_interrupt else []
+    from contextlib import nullcontext
+    from tools.delegate_tool_child_run import _refresh_parent_quota_wait
+    lock = getattr(parent, "_active_children_lock", None)
+    if joined:
+        with lock if lock is not None else nullcontext():
+            if getattr(parent, "_quota_wait_delegation_children", None) is None:
+                parent._quota_wait_delegation_children = []
+            parent._quota_wait_delegation_children.extend(joined)
+        _refresh_parent_quota_wait(parent)
+    try:
+        if len(batch.children) == 1:
+            results.append(batch.run_child(*batch.children[0]))
+            # Preserve existing detached per-child persistence before finalization.
+            _record_finished_child(batch, results[-1], honor_parent_interrupt)
+        else:
+            _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
+    finally:
+        if joined:
+            from agent.session_activity import set_quota_wait
+            with lock if lock is not None else nullcontext():
+                for child in joined:
+                    parent._quota_wait_delegation_children.remove(child)
+                if not parent._quota_wait_delegation_children:
+                    if getattr(parent, "_quota_wait_status", None) is not None:
+                        set_quota_wait(parent, None)
+                    parent._quota_wait_delegation_children = None
+            _refresh_parent_quota_wait(parent)
 
     _finalize_child_results(results, batch.task_list, batch.children, batch.parent_agent)
     total_duration = round(time.monotonic() - batch.overall_start, 2)
@@ -309,12 +334,24 @@ def _resolve_async_session_key(parent_agent: Any, origin_ui_session_id: str) -> 
             session_key = agent_session_id
     return session_key or agent_session_id, origin_ui_session_id
 
+class _QuotaProgressToken(tuple):
+    """Keep the existing (token, in_tool) callback and semantic tuple equality."""
+
+    quota_idle_seconds: float
+
+    def __new__(cls, parts, quota_idle):
+        token = super().__new__(cls, parts)
+        token.quota_idle_seconds = quota_idle
+        return token
+
+
 def _batch_progress_token(child_agents: list[Any]) -> tuple:
-    """Progress token for the async registry's stale monitor: every child's (api_call_count, current_tool,
-    last_activity_ts). last_activity_ts ticks on streamed chunks, tool transitions and API-call start/completion,
-    so a child streaming a long response counts as alive; a fully frozen token past the threshold means the batch
-    is wedged. ``in_tool`` is True while ANY child is inside a tool so slow tools get the higher ceiling (mirrors
-    the sync heartbeat)."""
+    """Semantic progress plus a separate quota-adjusted idle bound for the stale monitor.
+
+    The bound is not part of the progress token: a hold never manufactures model
+    or tool activity. Any live child's real wait protects its joined unit; spent
+    wait is excluded using that child's native activity stamp after release.
+    """
     # Progress token for the async registry's stale monitor: the combined (api_call_count, current_tool,
     # last_activity_ts) of every child. last_activity_ts is ticked by _touch_activity on every streamed
     # chunk ("receiving stream response"), every tool transition, and every API-call start/completion — so a
@@ -322,15 +359,18 @@ def _batch_progress_token(child_agents: list[Any]) -> tuple:
     # completes (same liveness signal as the compaction inactivity budget, PR #71508).
     parts = []
     in_tool = False
+    quota_idle = float("inf")
+    from tools.delegate_tool_child_run import _quota_stale_seconds
     for c in child_agents:
         try:
             summary = c.get_activity_summary()
             tool = summary.get("current_tool")
             parts.append((summary.get("api_call_count", 0), tool, summary.get("last_activity_ts")))
             in_tool = in_tool or bool(tool)
+            quota_idle = min(quota_idle, _quota_stale_seconds(c, float("inf")))
         except Exception:
             parts.append(None)
-    return tuple(parts), in_tool
+    return _QuotaProgressToken(parts, quota_idle), in_tool
 
 _BACKGROUND_NOTES = {
     "one": (

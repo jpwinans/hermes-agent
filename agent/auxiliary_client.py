@@ -125,6 +125,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
+from agent.quota_pacing_aux import admit_current as _admit_aux_request, admit_current_async as _admit_aux_request_async
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -257,14 +258,19 @@ def aux_interrupt_protection(active: bool = True, cancel_check=None, cancel_even
         _aux_interrupt_protection.cancel_event = prev_cancel_event
 
 
-def _capture_aux_cancel_check() -> Optional[Callable[[], Any]]:
-    """Capture the current explicit-cancel source on the owning request thread."""
+def _capture_aux_cancel_check(*, native_fallback: bool = False) -> Optional[Callable[[], Any]]:
+    """Capture explicit cancellation; native fallback is only for quota admission."""
     is_set = getattr(getattr(_aux_interrupt_protection, "cancel_event", None), "is_set", None)
     if callable(is_set):
         return is_set
-    # Return the callable itself so attempt-local decision objects keep begin_timeout_cleanup().
     check = getattr(_aux_interrupt_protection, "cancel_check", None)
-    return check if callable(check) else None
+    if callable(check) or not native_fallback:
+        return check if callable(check) else None
+    from tools.interrupt import acting_for_tid, is_thread_interrupted
+    origin_tid, owner_tid = threading.get_ident(), acting_for_tid.get()
+    # Capture ids before thread hops; latch an observed stop despite later bit clearing.
+    return _AuxiliaryCancellationDecision(
+        lambda: is_thread_interrupted(origin_tid) or is_thread_interrupted(owner_tid))
 
 
 def _captured_aux_cancel_requested(cancel_check: Callable[[], Any]) -> bool:
@@ -425,64 +431,53 @@ def _current_aux_stream_deadline() -> Optional[float]:
 
 
 @contextlib.contextmanager
-def aux_stream_deadline(deadline: float | Callable[[], float | None] | None):
-    """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
+def aux_stream_deadline(deadline: float | Callable[[], float | None] | None, *, quota_wait=None):
+    """Share a live host deadline and verified-wait hook with stream consumers.
 
-    ``None`` is a passthrough; re-entrant-safe. Host->worker return leg of the progress hook:
-    without it the isolated provider daemon streams to its own ceiling after the host stopped
-    waiting, billing a summary the commit fence refuses.
-
-    ``8207862212`` releases the compression OWNER when the fence is cancelled, but the isolated provider
-    daemon (:func:`_run_protected_sync_provider_call`) that holds the socket keeps streaming to its own
-    ``_aux_stream_total_ceiling`` budget — >= the host's ceiling by construction — billing an abandoned
-    summary the commit fence is already guaranteed to refuse, and stacking one fresh orphan per turn on a
-    session that compression never managed to shrink. See #99692.
+    None inherits the enclosing scope. The protected provider daemon must carry
+    both values: otherwise it outlives a stopped compression host (#99692).
     """
     previous = getattr(_aux_stream_deadline, "value", None)
+    previous_wait = getattr(_aux_stream_deadline, "quota_wait", None)
     _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) or callable(deadline) else previous
+    _aux_stream_deadline.quota_wait = quota_wait if quota_wait is not None else previous_wait
     try:
         yield
     finally:
         _aux_stream_deadline.value = previous
+        _aux_stream_deadline.quota_wait = previous_wait
 
 
 def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
-    """Run one protected provider callback in an attempt-isolated daemon thread.
-
-    Aux clients are process-shared and cannot be closed to wake one request, so the callback (incl.
-    stream aggregation) runs in a daemon while the owner polls cancellation; on cancel the owner
-    unwinds at once; the daemon stops at its next streamed chunk, else under the provider timeout in ``kwargs``
-    (it owns no transcript/commit state, never holds the session lock). Unprotected / no cancel source: direct.
-    """
+    """Isolate explicitly protected work; unprotected/source-free calls remain direct."""
     source_cancel_check = _capture_aux_cancel_check()
+    # Capture before thread hops; reuse the request's latch across stream/plain retries.
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is not None and "quota_cancel_check" not in context:
+        context["quota_cancel_check"] = source_cancel_check or _capture_aux_cancel_check(native_fallback=True)
     if not _aux_interrupt_protected() or not callable(source_cancel_check):
         return callback(kwargs)
-    # One linearized outcome per attempt: the host Event is reused/cleared on later turns and
-    # the Codex timeout Timer may race owner polling — same lock for both.
+    # Linearize cancellation vs timeout before the host reuses/clears its Event.
     cancel_check = _AuxiliaryCancellationDecision(source_cancel_check)
     if cancel_check():
         raise AuxiliaryExplicitCancellation()
-    # Thread-locals do not cross into the daemon: timing hooks fire from the thread running
-    # the callback, and the host deadline is inert unless carried along.
+    # Carry thread-local timing/deadline hooks into the daemon (#99692).
     progress_hook = getattr(_aux_progress, "hook", None)
     dispatch_hook = getattr(_aux_dispatch, "hook", None)
     provider_response_hook = getattr(_aux_provider_response, "hook", None)
     host_deadline = getattr(_aux_stream_deadline, "value", None)
+    quota_wait = getattr(_aux_stream_deadline, "quota_wait", None)
     reading_hook = current_prompt_reading_hook()
-    # #99692: the stream is consumed on the daemon below, and thread-locals do not cross that boundary — an
-    # owner-thread-only deadline would leave the fix inert on exactly the path large-session compression
-    # takes (protected call + hard-cancel source installed).
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
-
     def _provider_worker() -> None:
         try:
             with (
                 aux_progress_hook(progress_hook),
                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
-                aux_stream_deadline(host_deadline), prompt_reading_hook(reading_hook),
+                aux_stream_deadline(host_deadline, quota_wait=quota_wait), prompt_reading_hook(reading_hook),
                 aux_interrupt_protection(cancel_check=cancel_check),
             ):
                 outcome["result"] = callback(kwargs)
@@ -490,13 +485,11 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
             outcome["exception"] = exc
         finally:
             done.set()
-
     threading.Thread(
         target=provider_context.run, args=(_provider_worker,), name="hermes-protected-aux-provider",
         daemon=True).start()
     while True:
-        # Check cancel before AND after each wait so it wins when result publication and the
-        # host Event land in the same polling interval.
+        # Cancellation wins concurrent result publication, before and after waiting.
         if _captured_aux_cancel_requested(cancel_check):
             raise AuxiliaryExplicitCancellation()
         if not done.wait(0.02):
@@ -2636,15 +2629,13 @@ def _relay_sync_completion(
     kwargs = prepare_chat_messages(client, kwargs)
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
-    # Recovery rungs / credential retries keep the task's ``no_progress_timeout`` window; the
-    # first-token window uses this attempt's provider (fallbacks name theirs) for its stale timeout.
+    # Retry/fallback first-token windows use this attempt's provider, not the primary's.
     relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
     task = relay_context.get("task")
     relay_context["stream_provider"] = provider or relay_context.get("provider")
     callback = create or (lambda request: _create_with_progress(client, request, task))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    # Isolate only the provider callback so the owning thread can unwind its lease/DB
-    # transaction on hard cancel without touching the shared client.
+    # Isolate the provider callback, not the owning thread's lease/DB transaction.
     if route is None:
         return _run_protected_sync_provider_call(callback, kwargs)
     provider_name, fallback_model, metadata = route
@@ -2674,6 +2665,8 @@ async def _relay_async_completion(
 
     kwargs = prepare_chat_messages(client, kwargs)
     # Async twin of the seam default above (#98466).
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    relay_context["stream_provider"] = provider or relay_context.get("provider")
     callback = create or (lambda request: _acreate_with_progress(client, request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
@@ -2702,9 +2695,14 @@ def _relay_sync_stream(
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
     kwargs = prepare_chat_messages(client, kwargs)
-    # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
-    # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
-    create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
+    # Bypass only AFTER Relay has seen/rewritten the real conversation.
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    relay_context["stream_provider"] = provider or relay_context.get("provider")
+
+    def create(request):
+        request = bypass_chat_sdk_request_transform(request, client)
+        _admit_aux_request(client, request)
+        return client.chat.completions.create(**request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return create(kwargs)
@@ -2762,7 +2760,7 @@ def _runtime_main_value(field: str) -> Any:
 def set_runtime_main(
     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "",
+    cache_scope: str = "", quota_warning_callback: Optional[Callable[[str], Any]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2770,9 +2768,7 @@ def set_runtime_main(
     updated for old readers. ``cache_scope`` is the rotation-stable logical cache scope,
     preferred over ``session_id`` for prompt_cache_key derivation.
 
-    ``cache_scope`` is the rotation-stable logical cache scope (compression- lineage root —
-    agent/prompt_cache_scope.py) resolved once per turn by turn_context; auxiliary Responses calls prefer it
-    over ``session_id`` for prompt_cache_key derivation (#79017).
+    The optional warning callback is context-private, never a route or Relay metadata field.
     """
     runtime = {
         "provider": (provider or "").strip().lower(),
@@ -2783,7 +2779,7 @@ def set_runtime_main(
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
-        "cache_scope": (cache_scope or "").strip(),
+        "cache_scope": (cache_scope or "").strip(), "quota_warning_callback": quota_warning_callback if callable(quota_warning_callback) else None,
     }
     # Publish authoritative context before updating the locked mirrors.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -2805,7 +2801,9 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 def scoped_runtime_main(main_runtime: Optional[dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
     runtime = _normalize_main_runtime(main_runtime)
-    token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
+    # Routing normalization must not erase the native owner at the dispatch entry.
+    warning = _runtime_main_value("quota_warning_callback")
+    token = _RUNTIME_MAIN_CONTEXT.set({**runtime, "quota_warning_callback": warning} if runtime or callable(warning) else None)
     try:
         yield runtime
     finally:
@@ -7008,6 +7006,7 @@ def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
     return capped if capped >= _AFFORDABLE_RETRY_FLOOR_TOKENS else None
 
 
+
 def _create_with_progress(
     client: Any, kwargs: dict[str, Any], task: Optional[str] = None, *, force_stream: bool = False
 ) -> Any:
@@ -7049,34 +7048,28 @@ def _stream_request_plan(kwargs: dict[str, Any], client: Any = None) -> tuple[di
 def _create_with_progress_once(
     client: Any, kwargs: dict[str, Any], task: Optional[str] = None, *, force_stream: bool = False
 ) -> Any:
-    """create() that streams (and re-aggregates, ticking the hook per substantive chunk) when a
-    progress hook is active or the provider is stream-only; plain ``create(**kwargs)`` otherwise
-    or when the adapter streams internally. Streaming rejections fall back to a plain call —
-    except under ``force_stream``.
+    """Stream and aggregate when progress is observed or the route requires it.
 
-    Behavior is byte-for-byte identical to a plain ``create(**kwargs)`` when neither trigger applies (every
-    existing caller/task) or when the client's wire adapter streams internally. With a hook + a
-    chunk-capable client, the request is sent with ``stream=True`` and aggregated, ticking the hook only for
-    substantive chunks. The configured ``timeout`` acts per stream read (idle) rather than as a total
-    budget, and outer liveness watchdogs see tokens moving. ``force_stream=True`` (stream-only providers
-    such as Tencent Copilot — credit @kudi88, PR #60686) takes the same streamed path even without a hook.
-    Providers that reject the streamed request fall back to the plain non-streaming call — except under
-    ``force_stream``, where a stream-only provider rejects the plain call by definition, so the original
-    error is surfaced to the normal recovery chains instead.
+    Internally streaming adapters retain their native path. Otherwise substantive
+    chunks, not dispatch/keepalives, credit progress. A negotiation rejection may
+    retry plain once (unless force_stream); midstream failures reach recovery.
     """
     kwargs = bypass_chat_sdk_request_transform(kwargs, client)
-    _notify_aux_dispatch()
     # Dispatch alone is not forward progress: a 401/retry/fallback dispatch must not
     # reset the compression inactivity fence, or a zero-output attempt runs to the
     # total ceiling instead of idling out (#114938). Progress ticks only for
     # substantive stream payloads or a completed usable response.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+        _admit_aux_request(client, kwargs)
+        _notify_aux_dispatch()
         response = client.chat.completions.create(**kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
     try:
+        _admit_aux_request(client, stream_kwargs)
+        _notify_aux_dispatch()
         chunks = client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
@@ -7088,6 +7081,7 @@ def _create_with_progress_once(
         # request reproduces the real error for the except-chains.
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
+        _admit_aux_request(client, kwargs)
         _notify_aux_dispatch()
         response = client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
@@ -7282,6 +7276,7 @@ async def _aggregate_chat_stream_async(
 async def _acreate_with_stream(client: Any, kwargs: dict[str, Any], task: Optional[str] = None) -> Any:
     """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
+    await _admit_aux_request_async(client, stream_kwargs)
     chunks = await client.chat.completions.create(**stream_kwargs)
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
         return chunks
@@ -7299,15 +7294,18 @@ async def _acreate_with_progress(
     """Async :func:`_create_with_progress`: stream + re-aggregate (ticking the hook per substantive
     chunk) when a progress hook is active or the provider is stream-only; plain create otherwise."""
     kwargs = bypass_chat_sdk_request_transform(kwargs, client)
-    _notify_aux_dispatch()
     # Same contract as the sync twin (#114938): dispatch alone is not progress.
     if (not _aux_progress_active() and not force_stream) or _async_client_streams_internally(client):
+        await _admit_aux_request_async(client, kwargs)
+        _notify_aux_dispatch()
         response = await client.chat.completions.create(**kwargs)
         if not _async_client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
     try:
+        await _admit_aux_request_async(client, stream_kwargs)
+        _notify_aux_dispatch()
         chunks = await client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
@@ -7318,6 +7316,7 @@ async def _acreate_with_progress(
             raise
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
+        await _admit_aux_request_async(client, kwargs)
         _notify_aux_dispatch()
         response = await client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
@@ -8132,6 +8131,7 @@ def _call_llm_impl(
         if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
             # Responses-shim clients consume the stream internally and return a completed
             # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
+            _admit_aux_request(client, kwargs)
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 

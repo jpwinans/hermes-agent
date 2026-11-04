@@ -71,8 +71,9 @@ class ExecutionProgressStamper:
         now = time.monotonic()
         if now - self._last < self._every:
             return
-        # Idle past the cadence means the agent itself stopped: no stamp, so the ledger goes
-        # quiet exactly when the watchdog would.
+        # The caller excludes verified quota/repair waits from idle. During those waits
+        # this stamp means ownership liveness (also forwarded by cron.status), not model
+        # progress or a completed effect. Ordinary idle still leaves the ledger quiet.
         if self._idle_seconds() >= self._every:
             return
         self._last = now

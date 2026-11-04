@@ -64,12 +64,18 @@ from typing import Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
 
+_CONTAINED = (os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1"
+              and bool(os.environ.get("HERMES_TEST_ISOLATION"))
+              and not os.environ.get("PYTEST_CURRENT_TEST"))
+
 
 def _sweep_killed_run_roots(root: str) -> None:
     """Remove per-file temp roots older runs left behind. Each attempt deletes its own root
     in ``finally``, but a runner that is SIGKILLed (a tool timeout, a stray pkill) never gets
     there and leaks one root per in-flight worker; nothing else looks at this directory, so
     983 of them (3.4 GB) accumulated on one host in three days. Idle for a day = dead."""
+    if _CONTAINED:
+        return
     try:
         from hermes_constants_scratch import prune_idle_entries
     except ImportError:  # runner invoked from outside the repo root
@@ -101,7 +107,9 @@ def _runner_scratch_root() -> str:
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+    if _CONTAINED:
+        root = os.path.join(os.environ["TMPDIR"], name)
+    elif os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
     else:
         root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
@@ -157,6 +165,8 @@ _DEFAULT_FILE_RETRIES = 1
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+if _CONTAINED:
+    _DURATIONS_FILE = str(Path(os.environ["TMPDIR"]).resolve() / _DURATIONS_FILE)
 
 
 def _split_pathspec(value: str) -> list[str]:
@@ -439,6 +449,12 @@ def _kill_tree(proc: subprocess.Popen, pgid: int | None = None) -> None:
     if proc.pid is None:
         return
 
+    if _CONTAINED:
+        # Narrow pure-file lane: only the original, unreaped Popen child is owned.
+        if proc.returncode is None:
+            proc.kill()
+        return
+
     if sys.platform == "win32":
         try:
             
@@ -480,7 +496,7 @@ def _kill_detached_leftovers(temproot: str) -> None:
     made under it), so it names exactly this attempt's processes and nothing else.
     Linux-only (``/proc``); elsewhere the process-group kill is all there is.
     """
-    if not os.path.isdir("/proc"):
+    if _CONTAINED or not os.path.isdir("/proc"):
         return
     import signal as _signal
 
@@ -649,6 +665,8 @@ def _run_one_file_once(
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    if _CONTAINED:
+        print(f"Preserved attempt fixtures: {temproot}", flush=True)
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
@@ -699,6 +717,8 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        if _CONTAINED:
+            proc.communicate(timeout=10)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -712,7 +732,8 @@ def _run_one_file_once(
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
         # behind; make them writable and retry instead of skipping them.
-        _rmtree_force(temproot)
+        if not _CONTAINED:
+            _rmtree_force(temproot)
 
     if rc not in (0, 5) and not output.strip():
         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"

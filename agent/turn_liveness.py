@@ -154,7 +154,8 @@ class TurnLivenessWatchdog:
             generation = getattr(self._agent, "_turn_liveness_activity_generation", 0)
             activity_ts = getattr(self._agent, "_last_activity_ts", None)
         idle_seconds = 0.0 if activity_ts is None else max(0.0, time.time() - activity_ts)
-        return ActivitySnapshot(generation, activity_ts, idle_seconds)
+        from agent.session_activity import quota_idle_seconds
+        return ActivitySnapshot(generation, activity_ts, quota_idle_seconds(self._agent, idle_seconds))
 
     def _dump_turn_thread_stack(self) -> None:
         """Dump the turn thread's stack to the error log when the watchdog fires (#131740).

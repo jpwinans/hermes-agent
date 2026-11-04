@@ -198,6 +198,8 @@ class InterruptControlMixin:
                 self._interrupt_message = message
                 self._tool_interrupt_reason = tool_interrupt_reason
             self._interrupt_requested = True
+            for lifetime in getattr(self, "_quota_pacing_lifetimes", ()):
+                lifetime.cancel()
             self._turn_user_intervened = True
             # The turn record and the log must agree on WHO asked for the stop (#112647).
             logger.info("Interrupt requested (%s): %s", "hard" if hard_cancel else "soft", tool_interrupt_reason)
@@ -370,6 +372,8 @@ class InterruptControlMixin:
                 f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
             )
             self._interrupt_requested = True
+            for lifetime in getattr(self, "_quota_pacing_lifetimes", ()):
+                lifetime.cancel()
             self._interrupt_message = None
             self._turn_user_intervened = True
 

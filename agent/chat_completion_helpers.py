@@ -30,6 +30,7 @@ from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+from agent.client_lifecycle import _check_openai_snapshot_route
 from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
@@ -869,9 +870,10 @@ class _InlineRequest:
     unwind; ``cancelled`` lets an interrupt own the outcome so a racing timer can't
     misclassify the kill as staleness; ``stale`` is the one-shot transition."""
 
-    def __init__(self, agent, api_kwargs: dict, stale_timeout: float, call_start: float):
+    def __init__(self, agent, api_kwargs: dict, stale_timeout: float, call_start: float, *, _credential_snapshot=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
+        self._credential_snapshot = _credential_snapshot
         self.stale_timeout = stale_timeout
         self.call_start = call_start
         self.client = None
@@ -952,7 +954,8 @@ class _InlineRequest:
     def make_client(self, reason: str, kind: str = "openai"):
         # Only OpenAI-wire / Codex requests reach direct_api_call; ``kind`` exists
         # for signature parity with the dispatch helper.
-        client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
+        private = {} if self._credential_snapshot is None else {"_credential_snapshot": self._credential_snapshot}
+        client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs, **private)
         with self.lock:
             self.client = client
             stale_before_dispatch = self.stale
@@ -978,7 +981,7 @@ class _InlineRequest:
         return client
 
 
-def direct_api_call(agent, api_kwargs: dict):
+def direct_api_call(agent, api_kwargs: dict, *, _credential_snapshot=None):
     """Run a non-streaming LLM call inline on the conversation thread (cron turns,
     delegated children — see ``should_use_direct_api_call``): no interrupt worker,
     so the nested-pool deadlock cannot occur. An activity heartbeat keeps
@@ -987,6 +990,7 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
+    _check_openai_snapshot_route(agent, _credential_snapshot)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
@@ -998,7 +1002,8 @@ def direct_api_call(agent, api_kwargs: dict):
     hard_timeout = _inline_nonstream_hard_timeout(stale_timeout)
     if hard_timeout is not None and "timeout" not in api_kwargs:
         api_kwargs = {**api_kwargs, "timeout": hard_timeout}
-    request = _InlineRequest(agent, api_kwargs, stale_timeout, call_start)
+    private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+    request = _InlineRequest(agent, api_kwargs, stale_timeout, call_start, **private)
     request.start_watchdogs()
 
     # Only a clean return reports the reuse reason; errors/interrupts really
@@ -1257,7 +1262,7 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent, api_kwargs: dict, *, _credential_snapshot=None):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
@@ -1265,12 +1270,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     credentials / fall back."""
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
+    _check_openai_snapshot_route(agent, _credential_snapshot)
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+        return direct_api_call(agent, api_kwargs, **private)
     _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
     from agent.chat_completion_nonstream import _NonStreamRequest
 
-    return _NonStreamRequest(agent, api_kwargs).run()
+    private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+    return _NonStreamRequest(agent, api_kwargs, **private).run()
 
 
 def _consume_ephemeral_reasoning_off(agent) -> bool:
@@ -2200,13 +2208,21 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
 
 def _managed_summary_call(agent, api_request_id: str, request, callback, *, retry_count: int):
     from agent import relay_llm
-    return relay_llm.execute_current(
-        request, callback,
-        name=str(getattr(agent, "provider", "") or "provider"), model_name=str(getattr(agent, "model", "") or ""),
-        metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
-            "api_request_id": api_request_id, "call_role": "iteration_summary", "retry_count": retry_count},
-        defer_logical_completion=True,
-    )
+    from agent.quota_pacing_host import paced_call
+
+    def _send(built_request, *, _credential_snapshot=None):
+        # The secret stays in a closure, never in Relay kwargs or metadata.
+        send = callback if _credential_snapshot is None else lambda req: callback(
+            req, _credential_snapshot=_credential_snapshot)
+        return relay_llm.execute_current(
+            built_request, send,
+            name=str(getattr(agent, "provider", "") or "provider"), model_name=str(getattr(agent, "model", "") or ""),
+            metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
+                "api_request_id": api_request_id, "call_role": "iteration_summary", "retry_count": retry_count},
+            defer_logical_completion=True,
+        )
+
+    return paced_call(agent, request, _send)
 
 
 def _summary_text(agent, response, **normalize_kwargs) -> str:
@@ -2233,7 +2249,8 @@ def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
         # Route through the same seam as normal Codex turns: a direct _run_codex_stream
         # bypasses the stale/TTFB watchdogs, interrupt handling and client cleanup, so an
         # unattended cron summary could wedge forever (#70943).
-        return _summary_text(agent, agent._interruptible_api_call(codex_kwargs))
+        from agent.quota_pacing_host import paced_call
+        return _summary_text(agent, paced_call(agent, codex_kwargs, agent._interruptible_api_call))
     return _attempt
 
 
@@ -2506,13 +2523,14 @@ def _with_stream_emitters(agent, run):
     return response
 
 
-def _stream_codex_passthrough(agent, api_kwargs: dict, on_first_delta):
+def _stream_codex_passthrough(agent, api_kwargs: dict, on_first_delta, *, _credential_snapshot=None):
     """Codex streams internally via _run_codex_stream (reached through
     _interruptible_api_call); park ``on_first_delta`` on the agent so it can pick
     it up, and bracket the call with the stream start/end emitters."""
     agent._codex_on_first_delta = on_first_delta
     try:
-        return _with_stream_emitters(agent, lambda: agent._interruptible_api_call(api_kwargs))
+        private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+        return _with_stream_emitters(agent, lambda: agent._interruptible_api_call(api_kwargs, **private))
     finally:
         agent._codex_on_first_delta = None
 
@@ -2701,9 +2719,10 @@ class _StreamingCall(StreamingWaitMonitor):
     State shared between the request worker and the poll-loop monitor (heartbeat,
     stale kill, interrupt abort) lives on the instance, mutated from both threads."""
 
-    def __init__(self, agent, api_kwargs: dict, on_first_delta):
+    def __init__(self, agent, api_kwargs: dict, on_first_delta, *, _credential_snapshot=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
+        self._credential_snapshot = _credential_snapshot
         self.on_first_delta = on_first_delta
         self.worker = None  # request thread; None in inline mode
         self.result = {"response": None, "error": None, "partial_tool_names": []}
@@ -2945,8 +2964,10 @@ class _StreamingCall(StreamingWaitMonitor):
         # already 4xx'd on it this session (``_stream_options_unsupported``, see #9705).
         if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
             stream_kwargs["stream_options"] = {"include_usage": True}
+        snapshot = getattr(self, "_credential_snapshot", None)
+        private = {} if snapshot is None else {"_credential_snapshot": snapshot}
         request_client = self._attempt_request_client = self.clients.set_client(
-            self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
+            self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs, **private))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
         # #93650: as above — the streaming path carries the same bulk
@@ -3678,7 +3699,9 @@ class _StreamingCall(StreamingWaitMonitor):
         stale_timeout = self._stream_stale_timeout
         self._stream_stale_timeout = float("inf")  # no chunks arrive during the probe
         try:
-            probe = interruptible_api_call(self.agent, probe_kwargs)
+            snapshot = getattr(self, "_credential_snapshot", None)
+            private = {} if snapshot is None else {"_credential_snapshot": snapshot}
+            probe = interruptible_api_call(self.agent, probe_kwargs, **private)
         except (KeyboardInterrupt, InterruptedError):
             raise  # the outer handler routes user interrupts; never swallow them
         except Exception as probe_err:
@@ -3710,11 +3733,13 @@ class _StreamingCall(StreamingWaitMonitor):
         return True
 
     def _call_wire(self, stream_attempt_id: int):
+        _check_openai_snapshot_route(self.agent, getattr(self, "_credential_snapshot", None))
         if self.agent.api_mode != "anthropic_messages":
             return self._call_chat_completions(stream_attempt_id)
         # Per-request client so the watchdog aborts its socket, not the shared one.
+        private = {} if self._credential_snapshot is None else {"_credential_snapshot": self._credential_snapshot}
         request_client = self.clients.set_client(
-            self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
+            self.agent._create_request_anthropic_client(reason="anthropic_stream_request", **private), kind="anthropic_messages")
         return self._call_anthropic(request_client)
 
     def _call(self):
@@ -3974,20 +3999,23 @@ class _StreamingCall(StreamingWaitMonitor):
         return response
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None, _credential_snapshot=None):
     """Streaming variant of _interruptible_api_call: fires the delta callbacks per
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+    _check_openai_snapshot_route(agent, _credential_snapshot)
     if agent.api_mode == "codex_responses":
-        return _stream_codex_passthrough(agent, api_kwargs, on_first_delta)
+        private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+        return _stream_codex_passthrough(agent, api_kwargs, on_first_delta, **private)
     if agent.api_mode == "bedrock_converse":
         return _BedrockStream(agent, api_kwargs, on_first_delta).run()
     # Cross-turn stale-stream circuit breaker (see ``_stale_streak()``).
     _check_stale_giveup(agent)
-    return _StreamingCall(agent, api_kwargs, on_first_delta).run()
+    private = {} if _credential_snapshot is None else {"_credential_snapshot": _credential_snapshot}
+    return _StreamingCall(agent, api_kwargs, on_first_delta, **private).run()
 
 
 __all__ = [

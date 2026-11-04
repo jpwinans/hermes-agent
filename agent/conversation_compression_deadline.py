@@ -64,6 +64,58 @@ def effective_ceiling(fence: CompressionCommitFence, ceiling: float, wait_starte
     return ceiling if deadline is None else max(ceiling, deadline - wait_started)
 
 
+def quota_budget_clock(fence: CompressionCommitFence, now: float) -> float:
+    active = 0.0 if fence._quota_wait_started is None else now - fence._quota_wait_started
+    return now - fence._quota_paused - active
+
+
+def quota_deadline(fence: CompressionCommitFence, clock) -> float | None:
+    with fence._quota_clock_lock:
+        now = clock()
+        active = 0.0 if fence._quota_wait_started is None else now - fence._quota_wait_started
+        return None if fence._deadline is None else fence._deadline + active
+
+
+def quota_deadline_exceeded(fence: CompressionCommitFence, clock) -> bool:
+    with fence._quota_clock_lock:
+        now = clock()
+        deadline = quota_deadline(fence, lambda: now)
+        return deadline is not None and now >= deadline
+
+
+def account_quota_wait(fence: CompressionCommitFence, decision, clock) -> bool:
+    """Exclude verified waiting from idle AND absolute precommit consumption.
+
+    Entry must precede both expiries; cancellation/ownership revocation still win.
+    Exit freezes the extension for the fallback's remaining shared budget.
+    """
+    from agent.quota_pacing import Decision
+    if decision is not None and (not isinstance(decision, Decision) or decision.action not in ("hold", "blocked")):
+        return False
+    if not fence._lock.acquire(blocking=False):
+        return False
+    try:
+        with fence._quota_clock_lock:
+            now = clock()
+            if decision is None:
+                if fence._quota_wait_started is not None:
+                    paused = now - fence._quota_wait_started
+                    fence._quota_paused += paused
+                    if fence._deadline is not None:
+                        fence._deadline += paused
+                    fence._quota_wait_started = None
+                return not fence.is_cancelled
+            if fence.is_cancelled or fence._commit_started:
+                return False
+            if fence._idle_timeout_seconds is not None and fence.seconds_since_progress() >= fence._idle_timeout_seconds:
+                return False
+            if fence._quota_wait_started is None:
+                fence._quota_wait_started = now
+            return True
+    finally:
+        fence._lock.release()
+
+
 @contextlib.contextmanager
 def compression_deadline_scope(fence: Optional[CompressionCommitFence]):
     """Share *fence*'s deadline with the summary stream, live, and push it back while the
@@ -75,5 +127,5 @@ def compression_deadline_scope(fence: Optional[CompressionCommitFence]):
     if fence is None:
         yield
         return
-    with aux_stream_deadline(lambda: fence.deadline_monotonic), prompt_reading_hook(fence.extend_deadline):
+    with aux_stream_deadline(lambda: fence.deadline_monotonic, quota_wait=fence.quota_wait), prompt_reading_hook(fence.extend_deadline):
         yield

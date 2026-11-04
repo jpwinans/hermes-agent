@@ -310,10 +310,17 @@ def _binding_row(section, provider, model, credential, base_url):
             return row, 'explicit_unmetered'
     rows = [row for row in section.get('accounts', [])
             if isinstance(row, dict) and row.get('provider') == provider]
-    # Association selects a label; a pool reference or token-derived identity cannot.
+    # Only an operator row selects a label; a pool reference cannot.
     digest = hashlib.sha256(credential.encode()).hexdigest() if isinstance(credential, str) else ''
     matches = [row for row in rows if isinstance(row.get('credential_sha256'), str)
                and hmac.compare_digest(row['credential_sha256'], digest)]
+    if not matches and provider == 'openai-codex':
+        # An OAuth refresh rotates the bearer, not the ChatGPT account it acts for.
+        from agent.codex_headers import codex_account_headers
+        account_id = codex_account_headers(credential).get('ChatGPT-Account-ID')
+        matches = [r for r in rows if account_id and r.get('chatgpt_account_id') == account_id]
+        if len({r.get('account') for r in matches}) == 1:
+            matches = matches[:1]
     row = matches[0] if len(matches) == 1 else (rows[0] if len(rows) == 1 else {})
     if endpoint not in _ENDPOINTS.get(provider, set()):
         return row, 'endpoint_repair'
@@ -448,7 +455,8 @@ def bind_request(section, *, provider, model, credential, base_url,
     """Local-only bind; credential_ref is deliberately NOT account evidence.
 
     section: enabled: true; accounts: [{provider, account, credential_sha256,
-    state_dir, cache_dir (Claude shared snapshot directory)}]. Explicit unmetered
+    state_dir, cache_dir (Claude shared snapshot directory), chatgpt_account_id
+    (Codex only: keeps a refreshed token bound)}]. Explicit unmetered
     rows contain exactly provider and base_url. Host alone skips disabled mode.
     """
     return _Binding(section, provider, model, credential, base_url, session_id, cancelled)

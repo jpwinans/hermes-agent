@@ -72,8 +72,10 @@ def _resume_then_idle_steps():
 def test_turn_watchdog_thread_ignores_host_sleep(clock, monkeypatch):
     agent = _ScriptedAgent(clock, _resume_then_idle_steps())
     fired_at_read = []
+    # True: the abandon committed, so the watchdog stops (False means a quota wait declined it).
     monkeypatch.setattr(
-        gateway_run, "_abandon_timed_out_gateway_turn", lambda **_kw: fired_at_read.append(agent.reads))
+        gateway_run, "_abandon_timed_out_gateway_turn",
+        lambda **_kw: fired_at_read.append(agent.reads) or True)
 
     _watch_gateway_turn_inactivity(
         agent_holder=[agent], task_id="t", process_baseline=None, timeout=TIMEOUT_S,

@@ -160,7 +160,7 @@ def set_quota_wait(agent: Any, decision) -> None:
     with _activity_lock(agent):
         now = time.time()
         activity = getattr(agent, "_last_activity_ts", None)
-        started, credit, stamp = getattr(agent, "_quota_wait_clock", (None, 0.0, activity))
+        started, credit, stamp = quota_wait_clock(agent) or (None, 0.0, activity)
         if stamp != activity:
             credit = 0.0
         if decision is not None:
@@ -191,9 +191,24 @@ def set_quota_wait(agent: Any, decision) -> None:
             agent._emit_warning(notice)
 
 
+def quota_wait_clock(agent: Any) -> Optional[tuple]:
+    """The ``(started, credit, stamp)`` clock ``set_quota_wait`` wrote, or None before any wait.
+
+    Only that tuple counts: an agent-like stand-in that answers every attribute is not waiting.
+    """
+    clock = getattr(agent, "_quota_wait_clock", None)
+    return clock if type(clock) is tuple else None
+
+
+def quota_waiting(agent: Any) -> bool:
+    """True while the agent is inside a live quota wait."""
+    clock = quota_wait_clock(agent)
+    return clock is not None and clock[0] is not None
+
+
 def quota_idle_seconds(agent: Any, idle_seconds: float) -> float:
     """Exclude only live quota waits, retaining raw activity timestamps/labels."""
-    started, credit, stamp = getattr(agent, "_quota_wait_clock", (None, 0.0, None))
+    started, credit, stamp = quota_wait_clock(agent) or (None, 0.0, None)
     if started is not None:
         return 0.0
     if stamp != getattr(agent, "_last_activity_ts", None):

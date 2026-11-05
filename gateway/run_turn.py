@@ -1484,7 +1484,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
-                    if hasattr(agent_holder[0], "_quota_wait_clock"):
+                    from agent.session_activity import quota_wait_clock
+                    if quota_wait_clock(agent_holder[0]) is not None:
                         committed = await asyncio.to_thread(
                             _abandon_timed_out_gateway_turn, agent_holder=agent_holder,
                             inactivity_timeout=worker.agent_timeout, **self._reaper_kwargs(worker))

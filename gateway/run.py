@@ -2702,12 +2702,12 @@ def _abandon_timed_out_gateway_turn(
     with cleanup_lock:
         if worker_done.is_set() or timeout_fired.is_set():
             return False
-        if agent is not None and hasattr(agent, "_quota_wait_clock") and inactivity_timeout is not None:
-            from agent.session_activity import quota_idle_seconds
+        from agent.session_activity import quota_idle_seconds, quota_wait_clock, quota_waiting
+        if agent is not None and quota_wait_clock(agent) is not None and inactivity_timeout is not None:
             from agent.activity_tracking import _activity_lock
             with _activity_lock(agent):
                 activity = getattr(agent, "_last_activity_ts", None)
-                if getattr(agent, "_quota_wait_clock", (None,))[0] is not None:
+                if quota_waiting(agent):
                     return False
                 if activity is not None and quota_idle_seconds(agent, time.time() - activity) < inactivity_timeout:
                     return False
@@ -2762,7 +2762,8 @@ def _watch_gateway_turn_inactivity(
         now = time.monotonic()
         idle_seconds = now - activity_origin
         agent = agent_holder[0] if agent_holder else None
-        if agent is not None and getattr(agent, "_quota_wait_clock", (None,))[0] is not None:
+        from agent.session_activity import quota_waiting
+        if agent is not None and quota_waiting(agent):
             # A live local wait remains exempt even if diagnostic snapshot reading fails.
             awake_idle.measure(0.0)
             activity_origin = now
@@ -2785,8 +2786,8 @@ def _watch_gateway_turn_inactivity(
         if _abandon_timed_out_gateway_turn(
             agent_holder=agent_holder, task_id=task_id, process_baseline=process_baseline,
             worker_done=worker_done, timeout_fired=timeout_fired, cleanup_lock=cleanup_lock,
-            is_still_current=is_still_current, inactivity_timeout=timeout):
-            return
+            is_still_current=is_still_current, inactivity_timeout=timeout) or timeout_fired.is_set():
+            return  # keep watching only when a quota wait or fresh activity declined the abandon
 
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset({

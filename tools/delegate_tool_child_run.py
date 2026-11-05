@@ -304,9 +304,9 @@ def _child_last_event_age(child: Any) -> Optional[float]:
 
 def _quota_stale_seconds(child: Any, seconds: float) -> float:
     """A wait is liveness, not progress; retain its credit after the marker exits."""
-    if not hasattr(child, "_quota_wait_clock"):
+    from agent.session_activity import quota_idle_seconds, quota_wait_clock
+    if quota_wait_clock(child) is None:
         return seconds
-    from agent.session_activity import quota_idle_seconds
     age = _child_last_event_age(child)
     return min(seconds, quota_idle_seconds(child, age if age is not None else seconds))
 
@@ -314,15 +314,14 @@ def _quota_stale_seconds(child: Any, seconds: float) -> float:
 def _refresh_parent_quota_wait(parent: Any) -> bool:
     """Only a synchronous join owns this parent marker; detached work never does."""
     from agent.quota_pacing import Decision
-    from agent.session_activity import set_quota_wait
+    from agent.session_activity import quota_waiting, set_quota_wait
     lock = getattr(parent, "_active_children_lock", None)
     from contextlib import nullcontext
     with lock if lock is not None else nullcontext():
         children = getattr(parent, "_quota_wait_delegation_children", None)
         if children is None:
             return False
-        status = next((getattr(c, "_quota_wait_status", None) for c in children
-                       if getattr(c, "_quota_wait_clock", (None,))[0] is not None), None)
+        status = next((getattr(c, "_quota_wait_status", None) for c in children if quota_waiting(c)), None)
         if status != getattr(parent, "_quota_wait_status", None):
             set_quota_wait(parent, Decision(*status) if status is not None else None)
         return status is not None
@@ -365,7 +364,8 @@ class _Heartbeat:
         if not touch:
             return None
         parent_waiting = _refresh_parent_quota_wait(parent_agent)
-        if getattr(child, "_quota_wait_clock", (None,))[0] is not None:
+        from agent.session_activity import quota_waiting
+        if quota_waiting(child):
             return None  # policy/repair wait: neither stale nor semantic activity
         desc = f"delegate_task: subagent {task_index} working"
         try:
